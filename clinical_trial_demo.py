@@ -1,31 +1,29 @@
 """
-Clinical Trial Matching Copilot — Multi-Agent Demo (LangGraph + Groq)
-=====================================================================
+==============================================================================
+  CLINICAL TRIAL MATCHING COPILOT  —  A Multi-Agent Architecture Demo
+  LangGraph + Groq (Llama-3.3-70B)
+------------------------------------------------------------------------------
+  The code is organised into 8 numbered BLOCKS so it can be taught in order:
 
-A teaching demo of multi-agent architecture. Three agents share state:
-  - Researcher : extracts structured evidence (does NOT judge eligibility)
-  - Evaluator  : judges eligibility AND can bounce work back if evidence is weak
-  - Orchestrator: routes the flow, handles the bounce-back, finalizes
+    BLOCK 1  Imports & the demo switch
+    BLOCK 2  Shared State        (the whiteboard all agents read & write)
+    BLOCK 3  The model (Groq)     + crash-proof JSON parsing
+    BLOCK 4  Agent prompts        (the job description for each agent)
+    BLOCK 5  The agent NODES      (Researcher, Evaluator, Finaliser)
+    BLOCK 6  The ORCHESTRATOR     (the brain: routing + bounce-back)
+    BLOCK 7  Build the GRAPH      (wire the nodes together)
+    BLOCK 8  Run the demo
 
-THE TEACHING MOMENT:
-  The Evaluator is a *gatekeeper*. On the first pass the Researcher is
-  overconfident about the patient's liver status. The Evaluator catches it,
-  returns 'needs_more_evidence' with a pointed question, and the Orchestrator
-  routes BACK to the Researcher. Second pass, the Researcher is honest about
-  the unresolved hepatic severity. Now the Evaluator returns 'unclear' and we
-  finalize conservatively. The audience watches one agent correct another.
-
-THE CLIMAX:
-  Flip EVALUATOR_ENABLED = False and re-run. With no gatekeeper, the system
-  confidently finalizes with no caveat — proving live WHY the architecture
-  exists.
-
-Run:
-  pip install -U langgraph langchain langchain-groq
-  export GROQ_API_KEY="your_key"
-  python clinical_trial_demo.py
+  (c) Richard Abishai - richardabish.ai
+==============================================================================
 """
 
+# =============================================================================
+# BLOCK 1 - IMPORTS & THE DEMO SWITCH
+# -----------------------------------------------------------------------------
+# Flip EVALUATOR_ENABLED to False to run the "delete the gatekeeper" climax:
+# the system loses its ability to doubt and becomes confidently wrong.
+# =============================================================================
 import os
 import re
 import json
@@ -38,40 +36,38 @@ from langgraph.graph import StateGraph, END
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 
-# =====================================================================
-# DEMO SWITCH — flip this to False for the climax ("delete the gatekeeper")
-# =====================================================================
-EVALUATOR_ENABLED = False
+EVALUATOR_ENABLED = True          # <- the one line we toggle live
 
 
-# =====================================================================
-# 0. Pretty live logging so the audience SEES the graph execute
-# =====================================================================
-STEP = 0
-def log(node: str, msg: str) -> None:
-    global STEP
-    STEP += 1
-    print(f"\n[{STEP:02d}] -- {node.upper():<14} -- {msg}")
-
-
-# =====================================================================
-# 1. Shared State
-# =====================================================================
+# =============================================================================
+# BLOCK 2 - SHARED STATE
+# -----------------------------------------------------------------------------
+# Think of this as a shared whiteboard. Every agent reads from it and writes
+# back to it. In LangGraph each node takes the State and returns a partial
+# update to it - "State in, partial State out." That is the whole mental model.
+# =============================================================================
 class TrialState(TypedDict, total=False):
-    patient_case: str
-    trial_criteria: str
-    evidence_pack: Dict[str, Any]
-    evidence_gaps: List[str]
-    evaluator_report: Dict[str, Any]
-    final_recommendation: str
-    next_step: str
-    retry_count: int
-    bounce_reason: str        # the evaluator's question, fed back to researcher
+    patient_case: str               # raw input: the patient's notes
+    trial_criteria: str             # raw input: the trial's rules
+    evidence_pack: Dict[str, Any]   # researcher's structured extraction
+    evidence_gaps: List[str]        # what the researcher couldn't resolve
+    evaluator_report: Dict[str, Any]# evaluator's verdict + reasoning
+    final_recommendation: str       # the coordinator-facing output
+    next_step: str                  # the orchestrator's routing decision
+    retry_count: int                # how many times we've re-investigated
+    bounce_reason: str              # the evaluator's question, fed back
 
 
-# =====================================================================
-# 2. LLM — temperature 0 for a deterministic live demo
-# =====================================================================
+# =============================================================================
+# BLOCK 3 - THE MODEL (GROQ) + CRASH-PROOF JSON PARSING
+# -----------------------------------------------------------------------------
+# get_llm() is lazy so the file imports even without a key set.
+# temperature=0 -> the most deterministic behaviour a model gives (good onstage)
+#
+# safe_json() is the unsung hero of any live LLM demo. Models sometimes wrap
+# JSON in ```fences``` or add a chatty sentence. Calling json.loads() on raw
+# output WILL crash you mid-talk. This strips the junk and never throws.
+# =============================================================================
 _llm = None
 def get_llm():
     global _llm
@@ -84,11 +80,6 @@ def get_llm():
     return _llm
 
 
-# =====================================================================
-# 3. CRASH-PROOF JSON PARSING  (the thing that saves you on stage)
-#    LLMs sometimes wrap JSON in ```fences``` or add a preamble line.
-#    Never call json.loads() on raw model output in a live demo.
-# =====================================================================
 def safe_json(raw: Any) -> Dict[str, Any]:
     # Groq returns a string; handle list-of-parts defensively too.
     if isinstance(raw, list):
@@ -100,7 +91,7 @@ def safe_json(raw: Any) -> Dict[str, Any]:
         text = re.sub(r"^```(?:json)?", "", text).strip()
         text = re.sub(r"```$", "", text).strip()
 
-    # Grab the outermost {...} in case of preamble/postamble
+    # Grab the outermost { ... } in case of preamble / postamble
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         text = match.group(0)
@@ -109,21 +100,23 @@ def safe_json(raw: Any) -> Dict[str, Any]:
         return json.loads(text)
     except json.JSONDecodeError:
         # Last-resort fallback so the DEMO NEVER DIES mid-talk
-        return {
-            "_parse_error": True,
-            "_raw": str(raw)[:500],
-            "evidence_gaps": ["Parser fallback engaged"],
-        }
+        return {"_parse_error": True, "_raw": str(raw)[:400],
+                "evidence_gaps": ["Parser fallback engaged"]}
 
 
-# =====================================================================
-# 4. Prompts
-# =====================================================================
+# =============================================================================
+# BLOCK 4 - AGENT PROMPTS  (each agent's job description)
+# -----------------------------------------------------------------------------
+# Two specialists. Note the hard rules baked into each:
+#   - Researcher: extract only, NEVER decide. Be honest about gaps.
+#   - Evaluator : judge from evidence only, and it is ALLOWED to say
+#                 "needs_more_evidence" - i.e. permission to be uncertain.
+# =============================================================================
 researcher_prompt = ChatPromptTemplate.from_messages([
     ("system",
      """You are a clinical research EXTRACTION agent.
 Extract structured facts from the patient case and trial criteria.
-You do NOT decide eligibility — that is another agent's job.
+You do NOT decide eligibility - that is another agent's job.
 
 Return valid JSON only with keys:
   patient_facts, trial_requirements, evidence_gaps, matching_notes
@@ -149,11 +142,9 @@ verdict must be exactly one of:
 
 Rules:
 - Be conservative. Patient safety over optimism.
-- If a KEY EXCLUSION criterion cannot be cleared from the evidence,
-  AND this is the first review, return 'needs_more_evidence' and put a
-  precise question in questions_for_coordinator.
-- If evidence has already been re-reviewed and the gap remains genuinely
-  unresolvable, return 'unclear' (not needs_more_evidence).
+- If a KEY EXCLUSION criterion cannot be cleared from the evidence, AND this is
+  the first review, return 'needs_more_evidence' with a precise question.
+- If the gap remains genuinely unresolvable after re-review, return 'unclear'.
 - confidence is between 0 and 1.
 This is review pass #{review_pass}."""),
     ("human",
@@ -161,24 +152,29 @@ This is review pass #{review_pass}."""),
 ])
 
 
-# =====================================================================
-# 5. NODE FUNCTIONS  ◄◄◄ THESE ARE WHAT YOU TYPE LIVE
-# =====================================================================
+# =============================================================================
+# BLOCK 5 - THE AGENT NODES
+# -----------------------------------------------------------------------------
+# Each node is a plain function: takes State, returns a partial State update.
+# Notice the researcher's "bounce" branch - on a re-run it is steered by the
+# evaluator's exact question. The second pass is a TARGETED re-investigation,
+# not a blind retry.
+# =============================================================================
 def intake_node(state: TrialState) -> Dict[str, Any]:
-    log("intake", "new patient case received, resetting counters")
+    print(f"\n[INTAKE]       new case received")
     return {"retry_count": 0, "next_step": "research"}
 
 
 def researcher_node(state: TrialState) -> Dict[str, Any]:
     bounce = state.get("bounce_reason")
     if bounce:
-        log("researcher", f"RE-EXAMINING. Evaluator asked: {bounce}")
-        focus = ("FOCUS: An evaluator flagged unresolved exclusion criteria below. "
+        print(f"[RESEARCHER]   re-examining - evaluator asked: {bounce}")
+        focus = ("FOCUS: An evaluator flagged unresolved exclusion criteria. "
                  "Re-examine honestly. If severity is not explicit in the source, "
                  "mark it UNRESOLVED rather than inferring.\n"
                  f"Evaluator's question: {bounce}")
     else:
-        log("researcher", "first-pass extraction of patient + trial facts")
+        print(f"[RESEARCHER]   first-pass extraction")
         focus = ""
 
     chain = researcher_prompt | get_llm()
@@ -188,15 +184,14 @@ def researcher_node(state: TrialState) -> Dict[str, Any]:
         "focus": focus,
     }).content
     parsed = safe_json(raw)
-
     gaps = parsed.get("evidence_gaps", [])
-    log("researcher", f"extracted. evidence_gaps = {gaps}")
+    print(f"[RESEARCHER]   evidence_gaps = {gaps}")
     return {"evidence_pack": parsed, "evidence_gaps": gaps}
 
 
 def evaluator_node(state: TrialState) -> Dict[str, Any]:
     review_pass = state.get("retry_count", 0) + 1
-    log("evaluator", f"judging eligibility (review pass #{review_pass})")
+    print(f"[EVALUATOR]    judging (review pass #{review_pass})")
 
     chain = evaluator_prompt | get_llm()
     raw = chain.invoke({
@@ -204,10 +199,8 @@ def evaluator_node(state: TrialState) -> Dict[str, Any]:
         "review_pass": review_pass,
     }).content
     parsed = safe_json(raw)
-
-    verdict = parsed.get("verdict", "unclear")
-    conf = parsed.get("confidence", "?")
-    log("evaluator", f"verdict = {verdict.upper()}  (confidence {conf})")
+    print(f"[EVALUATOR]    verdict = {parsed.get('verdict','?').upper()} "
+          f"(confidence {parsed.get('confidence','?')})")
     return {"evaluator_report": parsed}
 
 
@@ -217,55 +210,62 @@ def finalizer_node(state: TrialState) -> Dict[str, Any]:
     questions = report.get("questions_for_coordinator", [])
 
     if verdict == "eligible":
-        txt = "Preliminary result: LIKELY ELIGIBLE. Next: coordinator review before screening."
+        txt = "LIKELY ELIGIBLE. Next: coordinator review before screening."
     elif verdict == "unlikely_eligible":
-        txt = "Preliminary result: UNLIKELY ELIGIBLE. Next: review exclusions, consider alternate trials."
+        txt = "UNLIKELY ELIGIBLE. Next: review exclusions, consider alternate trials."
     else:
-        txt = ("Preliminary result: POTENTIALLY ELIGIBLE, NOT SAFE TO FINALIZE. "
+        txt = ("POTENTIALLY ELIGIBLE, NOT SAFE TO FINALIZE. "
                "Next: obtain clarification on unresolved exclusion criteria.")
     if questions:
         txt += "\n  Open questions: " + "; ".join(questions)
 
-    log("finalize", "synthesizing coordinator note")
+    print(f"[FINALIZE]     done")
     return {"final_recommendation": txt, "next_step": "done"}
 
 
-# =====================================================================
-# 6. ORCHESTRATOR — the brain that routes (incl. the bounce-back)
-# =====================================================================
+# =============================================================================
+# BLOCK 6 - THE ORCHESTRATOR  (the brain)
+# -----------------------------------------------------------------------------
+# The only node that touches no medicine. It routes. Read the branches top to
+# bottom - the highlighted one is the whole demo:
+#   evaluator said "needs_more_evidence" -> DON'T finalize -> send work BACK to
+#   the researcher with the evaluator's question, and bump the retry counter.
+# In THIS 3-agent demo the routing is simple. In a real system (see the deck)
+# the orchestrator manages many agents, tools, retries, budgets and escalation
+# - that is where it earns its keep.
+# =============================================================================
 def orchestrator_node(state: TrialState) -> Dict[str, Any]:
-    # No evidence yet -> research
+    # 1) No evidence yet -> research
     if not state.get("evidence_pack"):
-        log("orchestrator", "no evidence yet -> route to researcher")
+        print("[ORCHESTRATOR] no evidence yet -> researcher")
         return {"next_step": "research"}
 
-    # Climax mode: no gatekeeper. Jump straight to finalize after research.
+    # 2) Climax mode: gatekeeper disabled -> finalise on raw research (unsafe)
     if not EVALUATOR_ENABLED:
         if not state.get("evaluator_report"):
-            log("orchestrator", "⚠ EVALUATOR DISABLED -> finalizing on raw research")
-            # fabricate an optimistic report to show the danger
-            return {"next_step": "finalize",
-                    "evaluator_report": {"verdict": "eligible"}}
+            print("[ORCHESTRATOR] !! EVALUATOR DISABLED -> finalising on raw research")
+            return {"next_step": "finalize", "evaluator_report": {"verdict": "eligible"}}
         return {"next_step": "finalize"}
 
-    # Normal mode: we have evidence but no judgment yet -> evaluate
+    # 3) Have evidence, no verdict yet -> evaluate
     if not state.get("evaluator_report"):
-        log("orchestrator", "evidence ready -> route to evaluator")
+        print("[ORCHESTRATOR] evidence ready -> evaluator")
         return {"next_step": "evaluate"}
 
-    # The GATEKEEPER bounce-back
+    # 4) * THE BOUNCE-BACK * - evaluator refused, and we can still retry
     verdict = state["evaluator_report"].get("verdict")
     if verdict == "needs_more_evidence" and state.get("retry_count", 0) < 1:
         q = (state["evaluator_report"].get("questions_for_coordinator") or ["(no question)"])[0]
-        log("orchestrator", f"evaluator BOUNCED IT BACK -> re-research. Q: {q}")
+        print(f"[ORCHESTRATOR] evaluator BOUNCED IT BACK -> re-research. Q: {q}")
         return {
             "next_step": "research",
             "bounce_reason": q,
             "retry_count": state.get("retry_count", 0) + 1,
-            "evaluator_report": None,   # clear so evaluator runs again
+            "evaluator_report": None,   # clear so evaluator runs fresh
         }
 
-    log("orchestrator", "judgment accepted -> finalize")
+    # 5) Verdict accepted (or retry budget spent) -> finalise
+    print("[ORCHESTRATOR] judgment accepted -> finalize")
     return {"next_step": "finalize"}
 
 
@@ -273,9 +273,13 @@ def router(state: TrialState) -> str:
     return state["next_step"]
 
 
-# =====================================================================
-# 7. BUILD GRAPH  (pre-written — you walk through this, don't type it)
-# =====================================================================
+# =============================================================================
+# BLOCK 7 - BUILD THE GRAPH  (wire the nodes together)
+# -----------------------------------------------------------------------------
+# Add nodes, set the entry point, then add edges. The conditional edges out of
+# the orchestrator are what make routing (and the bounce-back loop) possible.
+# graph.compile() validates the wiring before anything runs.
+# =============================================================================
 builder = StateGraph(TrialState)
 builder.add_node("intake", intake_node)
 builder.add_node("orchestrator", orchestrator_node)
@@ -296,9 +300,12 @@ builder.add_edge("finalize", END)
 graph = builder.compile()
 
 
-# =====================================================================
-# 8. DEMO INPUT
-# =====================================================================
+# =============================================================================
+# BLOCK 8 - RUN THE DEMO
+# -----------------------------------------------------------------------------
+# One realistic patient, one oncology trial. Most criteria clearly met - but
+# the liver/hepatic exclusion is ambiguous, which is what triggers the loop.
+# =============================================================================
 if __name__ == "__main__":
     initial_state: TrialState = {
         "patient_case": """
@@ -322,13 +329,13 @@ Exclusion:
 """,
     }
 
-    print("=" * 70)
+    print("=" * 68)
     print(f"  CLINICAL TRIAL MATCHING COPILOT   |  EVALUATOR_ENABLED = {EVALUATOR_ENABLED}")
-    print("=" * 70)
+    print("=" * 68)
 
     result = graph.invoke(initial_state)
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 68)
     print("  FINAL RECOMMENDATION")
-    print("=" * 70)
+    print("=" * 68)
     print(result["final_recommendation"])
